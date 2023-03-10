@@ -400,6 +400,8 @@ class FusionAttention(Fusion):
             else:
                 return
 
+        # the branch above is probably outdated as such nodes are now still fused to SkipLayerNorm (since 3 months ago)
+
         # SkipLayerNormalization has two inputs, and one of them is the root input for attention.
         qkv_nodes = self.model.match_parent_path(
             start_node,
@@ -461,6 +463,18 @@ class FusionAttention(Fusion):
         children = input_name_to_nodes[root_input]
         children_types = [child.op_type for child in children]
         if children_types.count("MatMul") != 3:
+            parent_layernorm = output_name_to_node[root_input]
+            print(parent_layernorm)
+            if len(parent_layernorm.output) < 4:
+                # not a SkipLayerNorm with multiple Add consumers
+                return
+            else:
+                root_input = parent_layernorm.output[0]
+
+        children = input_name_to_nodes[root_input]
+        children_types = [child.op_type for child in children]
+        if children_types.count("MatMul") != 3:
+            logger.debug("Still no matmul in children")
             return
 
         v_nodes = self.model.match_parent_path(matmul_qkv, ["Transpose", "Reshape", "Add", "MatMul"], [1, 0, 0, None])
@@ -471,11 +485,13 @@ class FusionAttention(Fusion):
 
         is_distill = False
         is_distill_add = False
+        is_no_mask_attention = False
         qk_paths = {
             "path1": (["Softmax", "Add", "Div", "MatMul"], [0, 0, None, 0]),
             "path2": (["Softmax", "Add", "Mul", "MatMul"], [0, 0, None, 0]),
             "path3": (["Softmax", "Where", "MatMul", "Div"], [0, 0, 2, 0]),
             "path4": (["Softmax", "Add", "Where", "MatMul"], [0, 0, 0, 2]),
+            "path5": (["Softmax", "Div", "MatMul"], [0, 0, 0]),
         }
 
         qk_nodes = None
@@ -487,6 +503,8 @@ class FusionAttention(Fusion):
                 is_distill = True
             if k == "path4":
                 is_distill_add = True
+            if k == "path5":
+                is_no_mask_attention = True
             break
 
         if qk_nodes is None:
@@ -500,6 +518,8 @@ class FusionAttention(Fusion):
             (_, where_qk, matmul_qk, _) = qk_nodes
         elif is_distill_add:
             (_, add_qk, where_qk, matmul_qk) = qk_nodes
+        elif is_no_mask_attention:
+            (_, _, matmul_qk) = qk_nodes
         else:
             (_, add_qk, _, matmul_qk) = qk_nodes
 
@@ -557,6 +577,8 @@ class FusionAttention(Fusion):
                 if add_qk_str is None:
                     logger.debug(f"fuse_attention: failed to verify shape inference of {add_qk}")
                     return
+        elif is_no_mask_attention:
+            pass
         else:
             _, mask_nodes, _ = self.model.match_parent_paths(
                 add_qk,
@@ -569,17 +591,17 @@ class FusionAttention(Fusion):
                 ],
                 output_name_to_node,
             )
-        if mask_nodes is None:
+        if mask_nodes is None and not is_no_mask_attention:
             logger.debug("fuse_attention: failed to match mask path")
             return
 
-        if len(mask_nodes) > 1 and mask_nodes[0].op_type == "Mul":
+        if not is_no_mask_attention and len(mask_nodes) > 1 and mask_nodes[0].op_type == "Mul":
             _, mul_val = self.model.get_constant_input(mask_nodes[0])
             if mul_val != -10000:
                 self.mask_filter_value = mul_val
 
         if matmul_v.input[0] == root_input and matmul_q.input[0] == root_input and matmul_k.input[0] == root_input:
-            mask_index = self.attention_mask.process_mask(mask_nodes[-1].input[0])
+            mask_index = self.attention_mask.process_mask(mask_nodes[-1].input[0]) if not is_no_mask_attention else None
 
             attention_last_node = reshape_qkv if einsum_node is None else transpose_qkv
 
